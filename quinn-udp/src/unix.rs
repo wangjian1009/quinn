@@ -68,16 +68,11 @@ impl Default for UdpSocketState {
 
 fn init(io: SockRef<'_>) -> io::Result<()> {
     let mut cmsg_platform_space = 0;
-    if cfg!(target_os = "linux") {
-        cmsg_platform_space +=
-            unsafe { libc::CMSG_SPACE(mem::size_of::<libc::in6_pktinfo>() as _) as usize };
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        cmsg_platform_space += unsafe { libc::CMSG_SPACE(mem::size_of::<libc::in6_pktinfo>() as _) as usize };
     }
 
-    assert!(
-        CMSG_LEN
-            >= unsafe { libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as _) as usize }
-                + cmsg_platform_space
-    );
+    assert!(CMSG_LEN >= unsafe { libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as _) as usize } + cmsg_platform_space);
     assert!(
         mem::align_of::<libc::cmsghdr>() <= mem::align_of::<cmsg::Aligned<[u8; 0]>>(),
         "control message buffers will be misaligned"
@@ -104,19 +99,22 @@ fn init(io: SockRef<'_>) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // opportunistically try to enable GRO. See gro::gro_segments().
-        let on: libc::c_int = 1;
-        unsafe {
-            libc::setsockopt(
-                io.as_raw_fd(),
-                libc::SOL_UDP,
-                libc::UDP_GRO,
-                &on as *const _ as _,
-                mem::size_of_val(&on) as _,
-            )
-        };
+        #[cfg(target_os = "linux")]
+        {
+            let on: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(
+                    io.as_raw_fd(),
+                    libc::SOL_UDP,
+                    libc::UDP_GRO,
+                    &on as *const _ as _,
+                    mem::size_of_val(&on) as _,
+                )
+            };
+        }
 
         // Forbid IPv4 fragmentation. Set even for IPv6 to account for IPv6 mapped IPv4 addresses.
         let rc = unsafe {
@@ -194,12 +192,7 @@ fn init(io: SockRef<'_>) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-fn send(
-    state: &UdpState,
-    io: SockRef<'_>,
-    last_send_error: &mut Instant,
-    transmits: &[Transmit],
-) -> io::Result<usize> {
+fn send(state: &UdpState, io: SockRef<'_>, last_send_error: &mut Instant, transmits: &[Transmit]) -> io::Result<usize> {
     let mut msgs: [libc::mmsghdr; BATCH_SIZE] = unsafe { mem::zeroed() };
     let mut iovecs: [libc::iovec; BATCH_SIZE] = unsafe { mem::zeroed() };
     let mut cmsgs = [cmsg::Aligned([0u8; CMSG_LEN]); BATCH_SIZE];
@@ -209,29 +202,18 @@ fn send(
     // containers. Their presence protects the SockAddr inside from
     // being assumed as initialized by the assume_init call.
     // TODO: Replace this with uninit_array once it becomes MSRV-stable
-    let mut addrs: [MaybeUninit<socket2::SockAddr>; BATCH_SIZE] =
-        unsafe { MaybeUninit::uninit().assume_init() };
+    let mut addrs: [MaybeUninit<socket2::SockAddr>; BATCH_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
     for (i, transmit) in transmits.iter().enumerate().take(BATCH_SIZE) {
         let dst_addr = unsafe {
-            ptr::write(
-                addrs[i].as_mut_ptr(),
-                socket2::SockAddr::from(transmit.destination),
-            );
+            ptr::write(addrs[i].as_mut_ptr(), socket2::SockAddr::from(transmit.destination));
             &*addrs[i].as_ptr()
         };
-        prepare_msg(
-            transmit,
-            dst_addr,
-            &mut msgs[i].msg_hdr,
-            &mut iovecs[i],
-            &mut cmsgs[i],
-        );
+        prepare_msg(transmit, dst_addr, &mut msgs[i].msg_hdr, &mut iovecs[i], &mut cmsgs[i]);
     }
     let num_transmits = transmits.len().min(BATCH_SIZE);
 
     loop {
-        let n =
-            unsafe { libc::sendmmsg(io.as_raw_fd(), msgs.as_mut_ptr(), num_transmits as u32, 0) };
+        let n = unsafe { libc::sendmmsg(io.as_raw_fd(), msgs.as_mut_ptr(), num_transmits as u32, 0) };
         if n == -1 {
             let e = io::Error::last_os_error();
             match e.kind() {
@@ -250,9 +232,7 @@ fn send(
                         // may already be in the pipeline, so we need to tolerate additional failures.
                         if state.max_gso_segments() > 1 {
                             tracing::error!("got EIO, halting segmentation offload");
-                            state
-                                .max_gso_segments
-                                .store(1, std::sync::atomic::Ordering::Relaxed);
+                            state.max_gso_segments.store(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
 
@@ -324,12 +304,7 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
     let mut hdrs = unsafe { mem::zeroed::<[libc::mmsghdr; BATCH_SIZE]>() };
     let max_msg_count = bufs.len().min(BATCH_SIZE);
     for i in 0..max_msg_count {
-        prepare_recv(
-            &mut bufs[i],
-            &mut names[i],
-            &mut ctrls[i],
-            &mut hdrs[i].msg_hdr,
-        );
+        prepare_recv(&mut bufs[i], &mut names[i], &mut ctrls[i], &mut hdrs[i].msg_hdr);
     }
     let msg_count = loop {
         let n = unsafe {
@@ -427,7 +402,7 @@ fn prepare_msg(
     }
 
     if let Some(ip) = &transmit.src_ip {
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "android")) {
             match ip {
                 IpAddr::V4(v4) => {
                     let pktinfo = libc::in_pktinfo {
@@ -442,9 +417,7 @@ fn prepare_msg(
                 IpAddr::V6(v6) => {
                     let pktinfo = libc::in6_pktinfo {
                         ipi6_ifindex: 0,
-                        ipi6_addr: libc::in6_addr {
-                            s6_addr: v6.octets(),
-                        },
+                        ipi6_addr: libc::in6_addr { s6_addr: v6.octets() },
                     };
                     encoder.push(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, pktinfo);
                 }
@@ -470,11 +443,7 @@ fn prepare_recv(
     hdr.msg_flags = 0;
 }
 
-fn decode_recv(
-    name: &MaybeUninit<libc::sockaddr_storage>,
-    hdr: &libc::msghdr,
-    len: usize,
-) -> RecvMeta {
+fn decode_recv(name: &MaybeUninit<libc::sockaddr_storage>, hdr: &libc::msghdr, len: usize) -> RecvMeta {
     let name = unsafe { name.assume_init() };
     let mut ecn_bits = 0;
     let mut dst_ip = None;
@@ -501,9 +470,7 @@ fn decode_recv(
             },
             (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
                 let pktinfo = unsafe { cmsg::decode::<libc::in_pktinfo>(cmsg) };
-                dst_ip = Some(IpAddr::V4(Ipv4Addr::from(
-                    pktinfo.ipi_addr.s_addr.to_ne_bytes(),
-                )));
+                dst_ip = Some(IpAddr::V4(Ipv4Addr::from(pktinfo.ipi_addr.s_addr.to_ne_bytes())));
             }
             (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
                 let pktinfo = unsafe { cmsg::decode::<libc::in6_pktinfo>(cmsg) };
@@ -520,8 +487,7 @@ fn decode_recv(
     let addr = match libc::c_int::from(name.ss_family) {
         libc::AF_INET => {
             // Safety: if the ss_family field is AF_INET then storage must be a sockaddr_in.
-            let addr: &libc::sockaddr_in =
-                unsafe { &*(&name as *const _ as *const libc::sockaddr_in) };
+            let addr: &libc::sockaddr_in = unsafe { &*(&name as *const _ as *const libc::sockaddr_in) };
             SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes()),
                 u16::from_be(addr.sin_port),
@@ -529,8 +495,7 @@ fn decode_recv(
         }
         libc::AF_INET6 => {
             // Safety: if the ss_family field is AF_INET6 then storage must be a sockaddr_in6.
-            let addr: &libc::sockaddr_in6 =
-                unsafe { &*(&name as *const _ as *const libc::sockaddr_in6) };
+            let addr: &libc::sockaddr_in6 = unsafe { &*(&name as *const _ as *const libc::sockaddr_in6) };
             SocketAddr::V6(SocketAddrV6::new(
                 Ipv6Addr::from(addr.sin6_addr.s6_addr),
                 u16::from_be(addr.sin6_port),
