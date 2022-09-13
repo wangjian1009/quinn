@@ -102,6 +102,7 @@ pub fn udp_state() -> super::UdpState {
     super::UdpState {
         max_gso_segments: std::sync::atomic::AtomicUsize::new(1),
         gro_segments: 1,
+        support_tos: std::sync::atomic::AtomicBool::new(true),
     }
 }
 

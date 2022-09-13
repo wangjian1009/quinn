@@ -6,7 +6,7 @@ use std::{
     mem::{self, MaybeUninit},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     os::unix::io::AsRawFd,
-    sync::atomic::AtomicUsize,
+    sync::atomic::{AtomicBool, AtomicUsize},
     time::Instant,
 };
 
@@ -208,7 +208,14 @@ fn send(state: &UdpState, io: SockRef<'_>, last_send_error: &mut Instant, transm
             ptr::write(addrs[i].as_mut_ptr(), socket2::SockAddr::from(transmit.destination));
             &*addrs[i].as_ptr()
         };
-        prepare_msg(transmit, dst_addr, &mut msgs[i].msg_hdr, &mut iovecs[i], &mut cmsgs[i]);
+        prepare_msg(
+            state,
+            transmit,
+            dst_addr,
+            &mut msgs[i].msg_hdr,
+            &mut iovecs[i],
+            &mut cmsgs[i],
+        );
     }
     let num_transmits = transmits.len().min(BATCH_SIZE);
 
@@ -236,6 +243,14 @@ fn send(state: &UdpState, io: SockRef<'_>, last_send_error: &mut Instant, transm
                         }
                     }
 
+                    #[cfg(target_os = "android")]
+                    if e.raw_os_error() == Some(libc::EINVAL) {
+                        if state.support_tos() {
+                            tracing::error!("got EINVAL, halting segmentation offload");
+                            state.support_tos.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+
                     // Other errors are ignored, since they will ususally be handled
                     // by higher level retransmits and timeouts.
                     // - PermissionDenied errors have been observed due to iptable rules.
@@ -257,19 +272,14 @@ fn send(state: &UdpState, io: SockRef<'_>, last_send_error: &mut Instant, transm
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn send(
-    _state: &UdpState,
-    io: SockRef<'_>,
-    last_send_error: &mut Instant,
-    transmits: &[Transmit],
-) -> io::Result<usize> {
+fn send(state: &UdpState, io: SockRef<'_>, last_send_error: &mut Instant, transmits: &[Transmit]) -> io::Result<usize> {
     let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
     let mut iov: libc::iovec = unsafe { mem::zeroed() };
     let mut ctrl = cmsg::Aligned([0u8; CMSG_LEN]);
     let mut sent = 0;
     while sent < transmits.len() {
         let addr = socket2::SockAddr::from(transmits[sent].destination);
-        prepare_msg(&transmits[sent], &addr, &mut hdr, &mut iov, &mut ctrl);
+        prepare_msg(state, &transmits[sent], &addr, &mut hdr, &mut iov, &mut ctrl);
         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &hdr, 0) };
         if n == -1 {
             let e = io::Error::last_os_error();
@@ -360,12 +370,14 @@ pub fn udp_state() -> UdpState {
     UdpState {
         max_gso_segments: AtomicUsize::new(gso::max_gso_segments()),
         gro_segments: gro::gro_segments(),
+        support_tos: AtomicBool::new(true),
     }
 }
 
 const CMSG_LEN: usize = 88;
 
 fn prepare_msg(
+    state: &UdpState,
     transmit: &Transmit,
     dst_addr: &socket2::SockAddr,
     hdr: &mut libc::msghdr,
@@ -392,7 +404,9 @@ fn prepare_msg(
     let mut encoder = unsafe { cmsg::Encoder::new(hdr) };
     let ecn = transmit.ecn.map_or(0, |x| x as libc::c_int);
     if transmit.destination.is_ipv4() {
-        encoder.push(libc::IPPROTO_IP, libc::IP_TOS, ecn as IpTosTy);
+        if state.support_tos() {
+            encoder.push(libc::IPPROTO_IP, libc::IP_TOS, ecn as IpTosTy);
+        }
     } else {
         encoder.push(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, ecn);
     }

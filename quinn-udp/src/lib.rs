@@ -5,7 +5,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::windows::io::AsRawSocket;
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -37,6 +37,7 @@ pub const BATCH_SIZE: usize = imp::BATCH_SIZE;
 pub struct UdpState {
     max_gso_segments: AtomicUsize,
     gro_segments: usize,
+    support_tos: AtomicBool,
 }
 
 impl UdpState {
@@ -61,6 +62,11 @@ impl UdpState {
     #[inline]
     pub fn gro_segments(&self) -> usize {
         self.gro_segments
+    }
+
+    #[inline]
+    pub fn support_tos(&self) -> bool {
+        self.support_tos.load(Ordering::Relaxed)
     }
 }
 
