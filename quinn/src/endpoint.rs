@@ -20,6 +20,7 @@ use proto::{
 use rustc_hash::FxHashMap;
 use tokio::sync::{mpsc, Notify};
 use udp::{RecvMeta, UdpState, BATCH_SIZE};
+use tracing::Instrument;
 
 use crate::{
     connection::Connecting, poll_fn, work_limiter::WorkLimiter, ConnectionEvent, EndpointConfig,
@@ -122,11 +123,17 @@ impl Endpoint {
             runtime.clone(),
         );
         let driver = EndpointDriver(rc.clone());
-        runtime.spawn(Box::pin(async {
-            if let Err(e) = driver.await {
-                tracing::error!("I/O error: {}", e);
+        runtime.spawn(Box::pin(
+            async {
+                tracing::info!("started");
+                if let Err(e) = driver.await {
+                    tracing::error!("I/O error: {}", e);
+                } else {
+                    tracing::info!("exited")
+                }
             }
-        }));
+            .instrument(tracing::info_span!("quinn-driver", addr = addr.to_string())),
+        ));
         Ok((
             Self {
                 inner: rc.clone(),
